@@ -1,6 +1,7 @@
 # kindle_to_foliate
-
-python3 kindle_to_foliate.py <original_epub_file> <annotation file from kindle> 
+```
+python3 kindle_to_foliate.py <original_epub_file> <annotation file from kindle>
+```
 
 Notes:
 1. The output file will be in the same directory as the original epub file, with the name `<original_epub_file>_annotated.epub`.
