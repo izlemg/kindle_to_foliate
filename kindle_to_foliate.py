@@ -339,6 +339,107 @@ def _build_html_pattern(text: str) -> str:
     return "".join(parts)
 
 
+def _parse_annotation_cfi(cfi_value: str):
+    """Parse our generated CFI into spine index and element path numbers.
+    Returns (spine_idx, path_numbers) or (None, None) if parsing fails.
+    """
+    m = re.match(r"^epubcfi\(/6/(\d+)!([^,]+),/1:(\d+),/1:(\d+)\)$", cfi_value)
+    if not m:
+        return None, None
+
+    spine_slot = int(m.group(1))
+    spine_idx = (spine_slot - 6) // 2
+    path_str = m.group(2)
+
+    path_numbers = []
+    for part in path_str.split("/"):
+        if part.isdigit():
+            path_numbers.append(int(part))
+
+    return spine_idx, path_numbers
+
+
+def _find_tag_child_by_index(parent, tag_index):
+    """Return the Nth tag child (1-based) of parent, or None."""
+    from bs4 import Tag
+
+    count = 0
+    for child in parent.children:
+        if isinstance(child, Tag):
+            count += 1
+            if count == tag_index:
+                return child
+    return None
+
+
+def _find_element_by_cfi_path(body, path_numbers):
+    """Resolve CFI path numbers to an element under body.
+
+    Path begins with /4/2 (html/body). Remaining even numbers are tag positions*2.
+    """
+    if not path_numbers:
+        return None
+
+    # Expect /4/2 at the start when CFI points into body.
+    if len(path_numbers) >= 2 and path_numbers[0] == 4 and path_numbers[1] == 2:
+        remaining = path_numbers[2:]
+    else:
+        remaining = path_numbers
+
+    current = body
+    for step in remaining:
+        if step % 2 != 0:
+            return None
+        child_idx = step // 2
+        nxt = _find_tag_child_by_index(current, child_idx)
+        if nxt is None:
+            return None
+        current = nxt
+
+    return current
+
+
+def _insert_mark_in_element(element, text, color_code):
+    """Insert first mark for text inside a specific element using HTML-aware regex.
+    Returns True if inserted.
+    """
+    inner_html = element.decode_contents()
+    pattern = re.compile(_build_html_pattern(text), re.DOTALL)
+    m = pattern.search(inner_html)
+    if not m:
+        return False
+
+    matched_html = m.group(0)
+    replacement = f'<mark style="background:{color_code}">{matched_html}</mark>'
+    new_inner = inner_html[:m.start()] + replacement + inner_html[m.end():]
+
+    frag = BeautifulSoup(new_inner, "html.parser")
+    element.clear()
+    for child in list(frag.contents):
+        element.append(child)
+
+    return True
+
+
+def _wrap_element_contents_with_mark(element, color_code):
+    """Fallback: wrap whole element contents in a mark tag.
+    Returns True if wrapping happened.
+    """
+    if element.find("mark"):
+        return False
+
+    inner_html = element.decode_contents().strip()
+    if not inner_html:
+        return False
+
+    wrapped = f'<mark style="background:{color_code}">{inner_html}</mark>'
+    frag = BeautifulSoup(wrapped, "html.parser")
+    element.clear()
+    for child in list(frag.contents):
+        element.append(child)
+    return True
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Convert Kindle highlights to Foliate-compatible annotations",
@@ -434,19 +535,27 @@ Examples:
             if item.get_type() == ebooklib.ITEM_DOCUMENT:
                 xhtml_paths[item.file_name] = item
         
-        # Build a list of highlights with CSS colors
+        # Build a list of annotations with CSS colors
         # Sort by length descending to avoid marking substrings first
-        matched_highlights = [(ann["text"], ann["color"]) for ann in annotations]
-        matched_highlights.sort(key=lambda x: len(x[0]), reverse=True)
+        matched_annotations = [
+            {
+                "id": i,
+                "text": ann["text"],
+                "color": ann["color"],
+                "value": ann.get("value", ""),
+            }
+            for i, ann in enumerate(annotations)
+        ]
+        matched_annotations.sort(key=lambda x: len(x["text"]), reverse=True)
         
         # Pre-compile regex patterns for each highlight
         highlight_patterns = []
-        for text, color in matched_highlights:
-            color_code = CSS_COLOR.get(color, "#fff59d")
-            pattern_str = _build_html_pattern(text)
+        for ann in matched_annotations:
+            color_code = CSS_COLOR.get(ann["color"], "#fff59d")
+            pattern_str = _build_html_pattern(ann["text"])
             try:
                 pat = re.compile(pattern_str, re.DOTALL)
-                highlight_patterns.append((pat, color_code, text))
+                highlight_patterns.append((pat, color_code, ann))
             except re.error:
                 pass
         
@@ -463,24 +572,103 @@ Examples:
                     zip_path_map[fname] = zn
                     break
         
+        # Map spine index -> href for CFI fallback targeting
+        spine_hrefs = []
+        for idref, _ in book.spine:
+            itm = book.get_item_with_id(idref)
+            spine_hrefs.append(itm.file_name if itm else None)
+
         # Read, modify, and rewrite each xhtml file
         modified_files = {}
+        inserted_ids = set()
         inserted_texts = set()
+        html_cache = {}
         with zipfile.ZipFile(output_epub, 'r') as zin:
             for fname, zpath in zip_path_map.items():
                 html = zin.read(zpath).decode('utf-8')
+                html_cache[zpath] = html
                 changed = False
-                for pat, color_code, text in highlight_patterns:
+                for pat, color_code, ann in highlight_patterns:
+                    if ann["id"] in inserted_ids:
+                        continue
                     m = pat.search(html)
                     if m:
                         matched_html = m.group(0)
                         replacement = f'<mark style="background:{color_code}">{matched_html}</mark>'
                         html = html[:m.start()] + replacement + html[m.end():]
                         inserted += 1
-                        inserted_texts.add(text)
+                        inserted_ids.add(ann["id"])
+                        inserted_texts.add(ann["text"])
                         changed = True
                 if changed:
+                    html_cache[zpath] = html
                     modified_files[zpath] = html.encode('utf-8')
+
+        # Fallback: for unmatched annotations, use CFI target element in parsed XHTML
+        unmatched = [ann for ann in matched_annotations if ann["id"] not in inserted_ids]
+        if unmatched:
+            soups = {}
+            soup_dirty = set()
+
+            for ann in unmatched:
+                cfi_value = ann.get("value", "")
+                spine_idx, path_numbers = _parse_annotation_cfi(cfi_value)
+                if spine_idx is None or spine_idx < 0 or spine_idx >= len(spine_hrefs):
+                    continue
+
+                href = spine_hrefs[spine_idx]
+                if not href:
+                    continue
+                zpath = zip_path_map.get(href)
+                if not zpath:
+                    continue
+
+                if zpath not in soups:
+                    soups[zpath] = BeautifulSoup(html_cache.get(zpath, ""), "lxml")
+
+                soup = soups[zpath]
+                body = soup.find("body")
+                if not body:
+                    continue
+
+                target_elem = _find_element_by_cfi_path(body, path_numbers)
+                if target_elem is None:
+                    # Last-resort fallback to normalized containment search
+                    res = find_containing_element(body, ann["text"], normalize)
+                    target_elem = res[0] if res else None
+                if target_elem is None:
+                    continue
+
+                color_code = CSS_COLOR.get(ann["color"], "#fff59d")
+                inserted_here = _insert_mark_in_element(target_elem, ann["text"], color_code)
+                if not inserted_here:
+                    # Final fallback for parser/markup edge cases: mark target element contents.
+                    target_text_norm = normalize(get_element_text(target_elem))
+                    ann_text_norm = normalize(ann["text"])
+                    if ann_text_norm and ann_text_norm in target_text_norm:
+                        inserted_here = _wrap_element_contents_with_mark(target_elem, color_code)
+
+                if not inserted_here:
+                    # Absolute fallback: search the whole document for a containing element.
+                    res = find_containing_element(body, ann["text"], normalize)
+                    doc_elem = res[0] if res else None
+                    if doc_elem is not None:
+                        inserted_here = _insert_mark_in_element(doc_elem, ann["text"], color_code)
+                        if not inserted_here:
+                            doc_text_norm = normalize(get_element_text(doc_elem))
+                            ann_text_norm = normalize(ann["text"])
+                            if ann_text_norm and ann_text_norm in doc_text_norm:
+                                inserted_here = _wrap_element_contents_with_mark(doc_elem, color_code)
+
+                if inserted_here:
+                    inserted += 1
+                    inserted_ids.add(ann["id"])
+                    inserted_texts.add(ann["text"])
+                    soup_dirty.add(zpath)
+
+            for zpath in soup_dirty:
+                html_cache[zpath] = str(soups[zpath])
+                modified_files[zpath] = html_cache[zpath].encode('utf-8')
         
         # Rewrite the zip with modified files
         if modified_files:
@@ -498,7 +686,7 @@ Examples:
         print(f"Inline highlights inserted: {inserted}")
         
         # Report annotations not inserted inline
-        not_inserted = [text for text, color in matched_highlights if text not in inserted_texts]
+        not_inserted = [ann["text"] for ann in matched_annotations if ann["id"] not in inserted_ids]
         if not_inserted:
             print(f"\nWarning: {len(not_inserted)} annotations not inserted inline:")
             for txt in not_inserted:
